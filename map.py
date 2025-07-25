@@ -2,7 +2,6 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial.transform import Rotation as R_scipy
 
 class SIFT_SLAM:
@@ -22,15 +21,35 @@ class SIFT_SLAM:
         self.current_pose = np.eye(4) # Global 4x4 poz matrisi (T_World_Camera)
         self.initial_yaw_offset = None # Başlangıç yaw'ını saklamak için
         self.current_yaw_degrees = 0.0 # Anlık yaw değerini saklamak için
+        self.yaw_accumulated_rad = 0.0
+        self.prev_yaw_rad = None
+        self.yaw_list = []
+        self.raw_yaw_list = []
 
         self.point_cloud_map = [] # 3D nokta bulutu haritası (opsiyonel olarak kalabilir)
         
-        # Kamera iç parametreleri (Kendi kalibrasyon değerlerinizle değiştirin!)
-        self.focal = 800
-        self.pp = (320, 240) # Genellikle görüntü genişliği/2, görüntü yüksekliği/2
-        self.K = np.array([[self.focal, 0, self.pp[0]],
-                           [0, self.focal, self.pp[1]],
-                           [0, 0, 1]], dtype=np.float32)
+        # # Kamera iç parametreleri (Kendi kalibrasyon değerlerinizle değiştirin!)
+        # self.focal = 800
+        # self.pp = (320, 240) # Genellikle görüntü genişliği/2, görüntü yüksekliği/2
+        # self.K = np.array([[self.focal, 0, self.pp[0]],
+        #                    [0, self.focal, self.pp[1]],
+        #                    [0, 0, 1]], dtype=np.float32)
+
+        # --- Kamera iç parametrelerini .npz dosyasından yükle ---
+        try:
+            calib_data = np.load("aicam_MultiMatrix2.npz")
+            self.K = calib_data['mtx'].astype(np.float32)  # Kamera iç matrisini al
+            self.dist_coeffs = calib_data['dist'].astype(np.float32)  # Distorsiyon katsayıları (isteğe bağlı)
+            print("Kamera kalibrasyon verileri başarıyla yüklendi.")
+        except Exception as e:
+            print(f"Kalibrasyon dosyası yüklenemedi: {e}")
+            print("Varsayılan iç parametreler kullanılacak.")
+            self.focal = 800
+            self.pp = (320, 240)
+            self.K = np.array([[self.focal, 0, self.pp[0]],
+                            [0, self.focal, self.pp[1]],
+                            [0, 0, 1]], dtype=np.float32)
+            self.dist_coeffs = np.zeros((1, 5), dtype=np.float32)
 
         # --- 2D İşgal Izgara Haritası Parametreleri ---
         self.map_resolution = 0.05 # Harita çözünürlüğü: piksel başına metre (örn: 0.05m/px = 5cm/px)
@@ -51,6 +70,11 @@ class SIFT_SLAM:
         self.robot_height = 0.5 
 
     def process_frame(self, frame):
+        # 0. Distorsiyon düzeltme
+        h, w = frame.shape[:2]
+        new_K, roi = cv2.getOptimalNewCameraMatrix(self.K, self.dist_coeffs, (w, h), 1, (w, h))
+        frame = cv2.undistort(frame, self.K, self.dist_coeffs, None, new_K)
+
         # 1. Zemin segmentasyonu
         seg_results = self.seg_model(frame, verbose=False)
         floor_mask = self._get_combined_mask(seg_results, frame.shape)
@@ -78,7 +102,7 @@ class SIFT_SLAM:
                 if m.distance < 0.75 * n.distance:
                     good_matches.append(m)
             
-            if len(good_matches) > 10:
+            if len(good_matches) > 100:
                 # 4. Poz tahmini ve 3D nokta kurtarma
                 R, t, new_points_3d = self._estimate_pose(good_matches, kp)
                 
@@ -190,58 +214,98 @@ class SIFT_SLAM:
             # Başlangıç yaw'ını 0'a sabitlemek için offset uygula
             adjusted_yaw_rad = current_yaw_rad - self.initial_yaw_offset
             self.current_yaw_degrees = np.degrees(adjusted_yaw_rad) # Dereceye çevir
+            
+    # def _update_occupancy_grid(self, frame, floor_mask, R_relative, t_relative):
+    #     robot_x_world = self.current_pose[0, 3]
+    #     robot_y_world = self.current_pose[1, 3]
+        
+    #     # print(f"DEBUG MAP: Robot World Pos: X={robot_x_world:.2f}, Y={robot_y_world:.2f}")
 
+    #     robot_map_x, robot_map_y = self._world_to_map(robot_x_world, robot_y_world)
+    #     # print(f"DEBUG MAP: Robot Map Pos: X={robot_map_x}, Y={robot_map_y}")
+
+    #     if 0 <= robot_map_x < self.map_pixel_size and 0 <= robot_map_y < self.map_pixel_size:
+    #         print("DEBUG MAP: Robot harita sınırları içinde.")
+    #         rows, cols = np.mgrid[max(0, robot_map_y - 2):min(self.map_pixel_size, robot_map_y + 3),
+    #                               max(0, robot_map_x - 2):min(self.map_pixel_size, robot_map_x + 3)]
+    #         self.occupancy_grid_map[rows, cols] = 255 # Boş olarak işaretle
+    #         # print(f"DEBUG MAP: {len(rows.flatten())} hücre boş olarak işaretlendi.")
+    #         # Harita genelinde kaç hücre 0, kaç hücre 255 oldu?
+    #         # print(f"DEBUG MAP: Haritada boş (0) hücre sayısı: {np.sum(self.occupancy_grid_map == 0)}")
+    #         # print(f"DEBUG MAP: Haritada dolu (255) hücre sayısı: {np.sum(self.occupancy_grid_map == 255)}")
+
+    #     else:
+    #         print("DEBUG MAP: Robot harita sınırları dışında! Harita güncellenmiyor.")
+    #         print(f"           Map_X: {robot_map_x}, Map_Y: {robot_map_y}")
+
+    #     # --- ESKİ ENGEL İŞLEME KODU BURADAN SONRA GELİYORDU VE ŞİMDİLİK YORUM SATIRI YAPILIYOR ---
+    #     # obstacle_mask = (floor_mask == 0).astype(np.uint8) 
+    #     # obstacle_pixels_y, obstacle_pixels_x = np.where(obstacle_mask == 1)
+    #     # if len(obstacle_pixels_x) == 0: return 
+    #     # cx, cy = self.K[0,2], self.K[1,2]
+    #     # fx, fy = self.K[0,0], self.K[1,1]
+    #     # x_norm = (obstacle_pixels_x - cx) / fx
+    #     # y_norm = (obstacle_pixels_y - cy) / fy
+    #     # Z_obstacle_guess = 1.5 # metre 
+    #     # points_cam = np.vstack((x_norm * Z_obstacle_guess, 
+    #     #                         y_norm * Z_obstacle_guess, 
+    #     #                         np.full_like(x_norm, Z_obstacle_guess)))
+    #     # R_wc = self.current_pose[:3, :3]
+    #     # t_wc = self.current_pose[:3, 3].reshape(3, 1) 
+    #     # points_world = (R_wc @ points_cam) + t_wc
+    #     # world_ox = points_world[0, :]
+    #     # world_oy = points_world[1, :]
+    #     # map_ox_pixels = ((world_ox - self.map_origin_x_meters) / self.map_resolution).astype(int)
+    #     # map_oy_pixels = ((world_oy - self.map_origin_y_meters) / self.map_resolution).astype(int)
+    #     # valid_map_indices = (map_ox_pixels >= 0) & (map_ox_pixels < self.map_pixel_size) & \
+    #     #                     (map_oy_pixels >= 0) & (map_oy_pixels < self.map_pixel_size)
+    #     # valid_map_ox = map_ox_pixels[valid_map_indices]
+    #     # valid_map_oy = map_oy_pixels[valid_map_indices]
+    #     # if len(valid_map_ox) > 0:
+    #     #     self.occupancy_grid_map[valid_map_oy, valid_map_ox] = 255 
+    #     #     kernel = np.ones((3,3),np.uint8) 
+    #     #     self.occupancy_grid_map = cv2.dilate(self.occupancy_grid_map, kernel, iterations = 1)
 
     def _update_occupancy_grid(self, frame, floor_mask, R_relative, t_relative):
+        # 1. Segmentasyon maskesindeki zemin noktalarını bul
+        floor_pixels_y, floor_pixels_x = np.where(floor_mask == 1)
+        if len(floor_pixels_x) == 0: return
+
+        # 2. Görüntüdeki bu noktaları normalize et (kamera modeline göre)
+        cx, cy = self.K[0, 2], self.K[1, 2]
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        x_norm = (floor_pixels_x - cx) / fx
+        y_norm = (floor_pixels_y - cy) / fy
+
+        # 3. Z tahmini (robotun yüksekliğine göre yere baksın)
+        Z_floor = self.robot_height
+        points_cam = np.vstack((x_norm * Z_floor,
+                                y_norm * Z_floor,
+                                np.full_like(x_norm, Z_floor)))
+
+        # 4. Kameradan dünya koordinatlarına çevir
+        R_wc = self.current_pose[:3, :3]
+        t_wc = self.current_pose[:3, 3].reshape(3, 1)
+        points_world = (R_wc @ points_cam) + t_wc
+
+        # 5. Bu noktaları harita koordinatlarına çevir
+        world_x = points_world[0, :]
+        world_y = points_world[1, :]
+        map_x = ((world_x - self.map_origin_x_meters) / self.map_resolution).astype(int)
+        map_y = ((world_y - self.map_origin_y_meters) / self.map_resolution).astype(int)
+
+        # 6. Geçerli sınırlar içinde olanları işle
+        valid = (map_x >= 0) & (map_x < self.map_pixel_size) & (map_y >= 0) & (map_y < self.map_pixel_size)
+        self.occupancy_grid_map[map_y[valid], map_x[valid]] = 255  # Gidilebilir alan: gri (free)
+
+        # 7. Robot pozisyonunu da 255 ile işaretle (kendi etrafı net olarak free)
         robot_x_world = self.current_pose[0, 3]
         robot_y_world = self.current_pose[1, 3]
-        
-        print(f"DEBUG MAP: Robot World Pos: X={robot_x_world:.2f}, Y={robot_y_world:.2f}")
-
         robot_map_x, robot_map_y = self._world_to_map(robot_x_world, robot_y_world)
-        print(f"DEBUG MAP: Robot Map Pos: X={robot_map_x}, Y={robot_map_y}")
 
         if 0 <= robot_map_x < self.map_pixel_size and 0 <= robot_map_y < self.map_pixel_size:
-            print("DEBUG MAP: Robot harita sınırları içinde.")
-            rows, cols = np.mgrid[max(0, robot_map_y - 2):min(self.map_pixel_size, robot_map_y + 3),
-                                  max(0, robot_map_x - 2):min(self.map_pixel_size, robot_map_x + 3)]
-            self.occupancy_grid_map[rows, cols] = 255 # Boş olarak işaretle
-            # print(f"DEBUG MAP: {len(rows.flatten())} hücre boş olarak işaretlendi.")
-            # Harita genelinde kaç hücre 0, kaç hücre 255 oldu?
-            # print(f"DEBUG MAP: Haritada boş (0) hücre sayısı: {np.sum(self.occupancy_grid_map == 0)}")
-            # print(f"DEBUG MAP: Haritada dolu (255) hücre sayısı: {np.sum(self.occupancy_grid_map == 255)}")
-
-        else:
-            print("DEBUG MAP: Robot harita sınırları dışında! Harita güncellenmiyor.")
-            print(f"           Map_X: {robot_map_x}, Map_Y: {robot_map_y}")
-
-        # --- ESKİ ENGEL İŞLEME KODU BURADAN SONRA GELİYORDU VE ŞİMDİLİK YORUM SATIRI YAPILIYOR ---
-        # obstacle_mask = (floor_mask == 0).astype(np.uint8) 
-        # obstacle_pixels_y, obstacle_pixels_x = np.where(obstacle_mask == 1)
-        # if len(obstacle_pixels_x) == 0: return 
-        # cx, cy = self.K[0,2], self.K[1,2]
-        # fx, fy = self.K[0,0], self.K[1,1]
-        # x_norm = (obstacle_pixels_x - cx) / fx
-        # y_norm = (obstacle_pixels_y - cy) / fy
-        # Z_obstacle_guess = 1.5 # metre 
-        # points_cam = np.vstack((x_norm * Z_obstacle_guess, 
-        #                         y_norm * Z_obstacle_guess, 
-        #                         np.full_like(x_norm, Z_obstacle_guess)))
-        # R_wc = self.current_pose[:3, :3]
-        # t_wc = self.current_pose[:3, 3].reshape(3, 1) 
-        # points_world = (R_wc @ points_cam) + t_wc
-        # world_ox = points_world[0, :]
-        # world_oy = points_world[1, :]
-        # map_ox_pixels = ((world_ox - self.map_origin_x_meters) / self.map_resolution).astype(int)
-        # map_oy_pixels = ((world_oy - self.map_origin_y_meters) / self.map_resolution).astype(int)
-        # valid_map_indices = (map_ox_pixels >= 0) & (map_ox_pixels < self.map_pixel_size) & \
-        #                     (map_oy_pixels >= 0) & (map_oy_pixels < self.map_pixel_size)
-        # valid_map_ox = map_ox_pixels[valid_map_indices]
-        # valid_map_oy = map_oy_pixels[valid_map_indices]
-        # if len(valid_map_ox) > 0:
-        #     self.occupancy_grid_map[valid_map_oy, valid_map_ox] = 255 
-        #     kernel = np.ones((3,3),np.uint8) 
-        #     self.occupancy_grid_map = cv2.dilate(self.occupancy_grid_map, kernel, iterations = 1)
+            self.occupancy_grid_map[max(0, robot_map_y-2):robot_map_y+3, 
+                                    max(0, robot_map_x-2):robot_map_x+3] = 255
 
 
     def _world_to_map(self, world_x, world_y):
@@ -251,8 +315,8 @@ class SIFT_SLAM:
 
         # Olası denemeler:
         # 1. Y eksenini ters çevir (eğer haritada yukarı gitmesi gereken aşağı gidiyorsa)
-        map_x = int((-world_x - self.map_origin_x_meters) / self.map_resolution)
-        map_y = int((-world_y - self.map_origin_y_meters) / self.map_resolution) # Y'yi ters çevir
+        map_x = int((world_x - self.map_origin_x_meters) / self.map_resolution)
+        map_y = int((world_y - self.map_origin_y_meters) / self.map_resolution) # Y'yi ters çevir
 
         # 2. X ve Y'yi takas et (eğer harita 90 derece dönmüş gibiyse)
         # map_x = int((world_y - self.map_origin_x_meters) / self.map_resolution)
@@ -307,6 +371,13 @@ class SIFT_SLAM:
         robot_map_x, robot_map_y = self._world_to_map(x, y)
         if 0 <= robot_map_x < self.map_pixel_size and 0 <= robot_map_y < self.map_pixel_size:
             cv2.circle(map_display, (robot_map_x, robot_map_y), 3, (0, 0, 255), -1) # Kırmızı nokta
+        # --- Trajectory çiz ---
+            if len(self.trajectory) > 1:
+                for i in range(1, len(self.trajectory)):
+                    x1, y1 = self._world_to_map(self.trajectory[i-1][0], self.trajectory[i-1][1])
+                    x2, y2 = self._world_to_map(self.trajectory[i][0], self.trajectory[i][1])
+                    if all(0 <= v < self.map_pixel_size for v in [x1, y1, x2, y2]):
+                        cv2.line(map_display, (x1, y1), (x2, y2), (0, 0, 255), 1)  # Kırmızı çizgi
 
         scale_factor = 2 
         map_display_resized = cv2.resize(map_display, 
@@ -317,8 +388,8 @@ class SIFT_SLAM:
         
         return vis_frame
 
-    def save_map_and_trajectory(self, map_filename="point_cloud_map.npy", traj_filename="trajectory.npy",
-                                occupancy_map_filename="occupancy_grid_map.png"):
+    def save_map_and_trajectory(self, map_filename="./outputs/point_cloud_map.npy", traj_filename="./outputs/trajectory.npy",
+                                occupancy_map_filename="./outputs/occupancy_grid_map.png"):
         if self.point_cloud_map:
             np.save(map_filename, np.array(self.point_cloud_map))
             print(f"Harita '{map_filename}' olarak kaydedildi. Toplam {len(self.point_cloud_map)} nokta.")
@@ -367,7 +438,7 @@ class SIFT_SLAM:
 # --- Kullanım Örneği ---
 if __name__ == "__main__":
     try:
-        slam = SIFT_SLAM("floor_segment_4temmuz.pt")
+        slam = SIFT_SLAM("./models/floor_segment_4temmuz.pt")
         print("YOLO modeli ve SIFT/BFMatcher başarıyla başlatıldı.")
     except Exception as e:
         print(f"HATA: SIFT_SLAM başlatılırken bir hata oluştu: {e}")
